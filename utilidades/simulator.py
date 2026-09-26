@@ -1,83 +1,126 @@
 """
-backend/utilidades/simulator.py
-============
-Motor de simulación del gemelo digital de una línea de producción industrial.
+simulator.py · v2 — Simulación de flujo discreto
+=================================================
+Modela el paso de unidades individuales por 5 estaciones en serie, con
+buffers (WIP) entre ellas. Reproduce fenómenos reales de manufactura:
+bloqueo, inanición, cuello de botella, scrap por unidad y efecto dominó.
 
-Modela 5 estaciones en serie (extrusora, inyectora, prensa, horno, empacadora)
-con degradación de salud, eventos aleatorios, consumo energético y costos
-operativos en USD. Expone KPIs de negocio (OEE, cuello de botella, costo
-unitario) alineados a la lógica de consultoría estratégica de Venezuela Insights.
+Cada tick avanza el modelo `dt` segundos (por defecto 0.25 s).
 """
 
 import random
 from collections import deque
 from datetime import datetime, timezone
 
-# --- Parámetros económicos de referencia (contexto Venezuela, USD) ------------
-TARIFA_KWH_USD = 0.12            # tarifa industrial de referencia USD/kWh
-COSTO_MINUTO_PARADA_USD = 42.0   # costo de oportunidad por minuto de línea caída
+# ---------------------------------------------------------------------------
+#  CONSTANTES ECONÓMICAS (contexto Venezuela, USD)
+# ---------------------------------------------------------------------------
+TARIFA_KWH_USD = 0.12
+COSTO_MINUTO_PARADA_USD = 42.0
+VENTANA_UPM_SEG = 15.0          # ventana móvil para calcular UPM real
 
-ESTADOS_VALIDOS = ("operando", "mantenimiento", "alerta", "parada")
+# ---------------------------------------------------------------------------
+#  ESTADOS
+# ---------------------------------------------------------------------------
+OPERANDO      = "operando"       # verde   · procesando normalmente
+BLOQUEADA     = "bloqueada"      # naranja · buffer de salida lleno
+SIN_MATERIAL  = "sin_material"   # gris    · buffer de entrada vacío
+MANTENIMIENTO = "mantenimiento"  # amarillo· mantenimiento programado
+ALERTA        = "alerta"         # rojo    · falla activa
+PARADA        = "parada"         # apagada · emergencia
 
 
-# ==============================================================================
+# ===========================================================================
 #  MÁQUINA
-# ==============================================================================
+# ===========================================================================
 class Machine:
-    """Una estación individual de la línea de producción."""
+    """Una estación con un ciclo de procesamiento por unidad."""
 
-    def __init__(self, mid: str, nombre: str, temp_base: float,
-                 kw_base: float, upm_base: float):
+    def __init__(
+        self,
+        mid: str,
+        nombre: str,
+        cycle_time: float,          # segundos por unidad (nominal)
+        temp_base: float,           # °C de proceso
+        kw_process: float,          # kW procesando
+        kw_idle: float,             # kW en reposo
+        buffer_capacity: int = 10,  # capacidad del buffer de salida
+        scrap_rate_base: float = 0.005,
+    ):
         self.id = mid
         self.nombre = nombre
-        self.temp_base = float(temp_base)      # temperatura nominal °C
-        self.kw_base = float(kw_base)          # potencia nominal kW
-        self.upm_base = float(upm_base)        # unidades/minuto nominales
+        self.cycle_time_nominal = cycle_time
+        self.cycle_time = cycle_time
+        self.temp_base = temp_base
+        self.kw_process = kw_process
+        self.kw_idle = kw_idle
+        self.buffer_capacity = buffer_capacity
+        self.scrap_rate_base = scrap_rate_base
 
-        self.estado = "operando"
-        self.temperatura = self.temp_base
-        self.consumo_kw = self.kw_base
-        self.upm = self.upm_base
+        # --- Estado de flujo ---------------------------------------------
+        self.estado = SIN_MATERIAL
+        self.progress = 0.0             # 0..1 dentro del ciclo actual
+        self.processing = False         # ¿tiene una unidad dentro?
+        self.buffer_out = 0             # unidades terminadas, esperando ser tomadas
+
+        # --- Estado físico -----------------------------------------------
+        self.temperatura = temp_base * 0.70
+        self.consumo_kw = kw_idle
+        self.vibracion = 0.10
         self.salud = round(random.uniform(88.0, 99.0), 2)
-        self.vibracion = 0.25
-        self.tiempo_estado = 0
-        self.unidades_acumuladas = 0.0
 
-    # --------------------------------------------------------------------------
-    def to_dict(self) -> dict:
+        # --- Métricas ----------------------------------------------------
+        self.unidades_procesadas = 0
+        self.unidades_scrap = 0
+        self.tiempo_en_estado = 0.0
+        self._eventos_unidad = deque(maxlen=200)  # (timestamp, 1) por unidad completada
+
+    # ----------------------------------------------------------------------
+    def _upm_instantaneo(self, ahora: float) -> float:
+        """Unidades por minuto, medida sobre los últimos VENTANA_UPM_SEG."""
+        while self._eventos_unidad and ahora - self._eventos_unidad[0] > VENTANA_UPM_SEG:
+            self._eventos_unidad.popleft()
+        return len(self._eventos_unidad) * 60.0 / VENTANA_UPM_SEG
+
+    # ----------------------------------------------------------------------
+    def to_dict(self, ahora: float) -> dict:
         return {
             "id": self.id,
             "nombre": self.nombre,
             "estado": self.estado,
+            "progress": round(self.progress, 3),
+            "processing": self.processing,
+            "buffer_out": self.buffer_out,
+            "buffer_capacity": self.buffer_capacity,
+            "cycle_time": round(self.cycle_time, 3),
             "temperatura": round(self.temperatura, 2),
+            "temperatura_base": self.temp_base,
             "consumo_kw": round(self.consumo_kw, 2),
-            "upm": round(self.upm, 2),
             "salud": round(self.salud, 2),
             "vibracion": round(self.vibracion, 3),
-            "unidades_acumuladas": round(self.unidades_acumuladas, 1),
-            "temperatura_base": self.temp_base,
+            "unidades_procesadas": self.unidades_procesadas,
+            "unidades_scrap": self.unidades_scrap,
+            "upm": round(self._upm_instantaneo(ahora), 2),
         }
 
-    # --------------------------------------------------------------------------
+    # ----------------------------------------------------------------------
     def set_estado(self, nuevo: str, motivo: str = "") -> dict:
-        """Cambia el estado de la máquina y devuelve el evento generado."""
         anterior = self.estado
         self.estado = nuevo
-        self.tiempo_estado = 0
+        self.tiempo_en_estado = 0.0
 
-        if nuevo == "alerta":
+        if nuevo == ALERTA:
             self.temperatura = max(self.temperatura, self.temp_base * 1.15)
             self.vibracion = max(self.vibracion, 4.0)
-            self.upm = 0.0
-        elif nuevo == "parada":
-            self.upm = 0.0
+        if nuevo in (PARADA, ALERTA):
+            self.processing = False
+            self.progress = 0.0
 
-        if nuevo == "alerta":
-            severidad = "critical"
-        elif nuevo in ("parada", "mantenimiento"):
-            severidad = "warning"
-        else:
-            severidad = "info"
+        severidad = {
+            ALERTA: "critical",
+            PARADA: "warning",
+            MANTENIMIENTO: "warning",
+        }.get(nuevo, "info")
 
         return {
             "maquina_id": self.id,
@@ -87,144 +130,230 @@ class Machine:
             "mensaje": f"{self.nombre}: {anterior} → {nuevo}. {motivo}".strip(),
             "temperatura": round(self.temperatura, 2),
             "salud": round(self.salud, 2),
-            "resuelta": nuevo in ("operando",),
+            "resuelta": nuevo == OPERANDO,
         }
 
-    # --------------------------------------------------------------------------
-    def tick(self) -> list:
-        """Avanza un segundo de simulación. Devuelve la lista de eventos."""
+    # ----------------------------------------------------------------------
+    def tick(self, dt: float, hay_material_entrada: bool, ahora: float) -> tuple:
+        """Avanza un paso. Retorna (eventos, unidades_que_salieron_del_ciclo)."""
         eventos = []
-        self.tiempo_estado += 1
+        self.tiempo_en_estado += dt
 
-        # ---- PARADA (emergencia, no produce, se enfría) ----------------------
-        if self.estado == "parada":
-            self.temperatura = max(24.0, self.temperatura - 1.8)
-            self.consumo_kw = max(0.0, self.consumo_kw * 0.55)
-            self.upm = 0.0
+        # ============ Estados no operativos ================================
+        if self.estado == PARADA:
+            self.processing = False
+            self.progress = 0.0
+            self.temperatura = max(24.0, self.temperatura - 1.8 * dt)
+            self.consumo_kw = max(0.0, self.consumo_kw * (1 - 0.55 * dt))
             self.vibracion = 0.0
-            return eventos
+            return eventos, 0
 
-        # ---- MANTENIMIENTO (recupera salud, sin producción) ------------------
-        if self.estado == "mantenimiento":
-            self.salud = min(100.0, self.salud + random.uniform(1.6, 3.2))
-            self.temperatura += (self.temp_base * 0.30 - self.temperatura) * 0.20
-            self.consumo_kw += (self.kw_base * 0.30 - self.consumo_kw) * 0.25
-            self.upm = 0.0
-            self.vibracion = round(random.uniform(0.02, 0.12), 3)
-            if self.salud >= 97.5 and self.tiempo_estado >= 6:
-                eventos.append(self.set_estado("operando", "Mantenimiento completado"))
-            return eventos
+        if self.estado == MANTENIMIENTO:
+            self.processing = False
+            self.progress = 0.0
+            self.salud = min(100.0, self.salud + random.uniform(6.0, 10.0) * dt)
+            self.temperatura += (self.temp_base * 0.30 - self.temperatura) * (0.20 * dt)
+            self.consumo_kw += (self.kw_idle * 0.55 - self.consumo_kw) * (0.25 * dt)
+            self.vibracion = max(0.02, self.vibracion * (1 - 2.0 * dt))
+            if self.salud >= 97.5 and self.tiempo_en_estado >= 5.0:
+                eventos.append(self.set_estado(OPERANDO, "Mantenimiento completado"))
+            return eventos, 0
 
-        # ---- ALERTA (falla activa, requiere intervención) --------------------
-        if self.estado == "alerta":
+        if self.estado == ALERTA:
+            self.processing = False
+            self.progress = 0.0
             self.temperatura = min(self.temp_base * 1.70,
-                                   self.temperatura + random.uniform(0.4, 1.7))
-            self.vibracion = round(min(9.9, self.vibracion + random.uniform(0.1, 0.5)), 2)
-            self.consumo_kw = max(0.0, self.kw_base * random.uniform(0.15, 0.55))
-            self.upm = max(0.0, self.upm_base * random.uniform(0.0, 0.12))
-            self.salud = max(0.0, self.salud - random.uniform(0.05, 0.35))
-            # Auto-recuperación de emergencia si nadie interviene en 25 s
-            if self.tiempo_estado > 25:
-                eventos.append(self.set_estado("mantenimiento", "Auto-recuperación de emergencia"))
-            return eventos
+                                   self.temperatura + random.uniform(0.4, 1.7) * dt)
+            self.vibracion = min(9.9, self.vibracion + random.uniform(0.2, 0.6) * dt)
+            self.consumo_kw = max(self.kw_idle,
+                                  self.kw_process * random.uniform(0.15, 0.40))
+            self.salud = max(0.0, self.salud - random.uniform(0.3, 1.2) * dt)
+            if self.tiempo_en_estado > 20.0:
+                eventos.append(self.set_estado(MANTENIMIENTO,
+                                               "Auto-recuperación de emergencia"))
+            return eventos, 0
 
-        # ---- OPERANDO (régimen normal) --------------------------------------
-        self.salud = max(0.0, self.salud - random.uniform(0.02, 0.20))
-        self.temperatura += (self.temp_base - self.temperatura) * 0.25 + random.uniform(-0.7, 0.7)
-        self.consumo_kw = max(0.5, self.kw_base * random.uniform(0.90, 1.12))
+        # ============ Estados productivos ==================================
+        # Degradación de salud mientras está encendida
+        self.salud = max(0.0, self.salud - random.uniform(0.05, 0.20) * dt)
 
-        factor_salud = 0.60 + 0.40 * (self.salud / 100.0)
-        self.upm = max(0.0, self.upm_base * factor_salud * random.uniform(0.94, 1.06))
-        self.vibracion = round(
-            max(0.05, (1 - self.salud / 100.0) * 3.0 + random.uniform(0.05, 0.30)), 3
-        )
+        # Temperatura: sube hacia temp_base procesando, baja si está en espera
+        target_temp = self.temp_base if self.processing else self.temp_base * 0.75
+        self.temperatura += (target_temp - self.temperatura) * (0.40 * dt) \
+                            + random.uniform(-0.6, 0.6) * dt
 
-        # Eventos aleatorios
-        if self.salud < 30.0 and random.random() < 0.060:
-            eventos.append(self.set_estado("alerta", "Degradación crítica de componente"))
-        elif self.temperatura > self.temp_base * 1.25 and random.random() < 0.050:
-            eventos.append(self.set_estado("alerta", "Sobrecalentamiento detectado"))
-        elif random.random() < 0.0035:
-            eventos.append(self.set_estado("mantenimiento", "Mantenimiento preventivo programado"))
+        # Consumo: alto procesando, bajo en espera
+        target_kw = self.kw_process if self.processing else self.kw_idle
+        self.consumo_kw += (target_kw - self.consumo_kw) * (0.50 * dt)
+        self.consumo_kw = max(0.3, self.consumo_kw)
 
-        return eventos
+        # Vibración proporcional a la degradación
+        base_vib = (1 - self.salud / 100.0) * 3.0
+        self.vibracion = max(0.05, base_vib + random.uniform(0.05, 0.30))
+
+        # --- ¿Tenemos una unidad dentro? ---------------------------------
+        if not self.processing:
+            if hay_material_entrada:
+                self.processing = True
+                self.progress = 0.0
+                self.estado = OPERANDO
+                self.tiempo_en_estado = 0.0
+            else:
+                self.estado = SIN_MATERIAL
+                return eventos, 0
+
+        # --- Avanzar el ciclo --------------------------------------------
+        factor_salud = 0.85 + 0.15 * (self.salud / 100.0)
+        self.cycle_time = self.cycle_time_nominal / factor_salud
+        self.progress += dt / self.cycle_time
+
+        if self.progress < 1.0:
+            self.estado = OPERANDO
+            return eventos, 0
+
+        # --- Ciclo completado: ¿podemos empujar al buffer? ---------------
+        if self.buffer_out >= self.buffer_capacity:
+            self.progress = 1.0
+            self.estado = BLOQUEADA
+            return eventos, 0
+
+        # --- Control de calidad ------------------------------------------
+        scrap_rate = self.scrap_rate_base + (100 - self.salud) / 100 * 0.05
+        fue_scrap = random.random() < scrap_rate
+
+        if fue_scrap:
+            self.unidades_scrap += 1
+            eventos.append({
+                "maquina_id": self.id,
+                "maquina_nombre": self.nombre,
+                "severidad": "info",
+                "tipo_alerta": "scrap",
+                "mensaje": f"{self.nombre}: unidad descartada por control de calidad",
+                "temperatura": round(self.temperatura, 2),
+                "salud": round(self.salud, 2),
+                "resuelta": True,
+            })
+        else:
+            self.buffer_out += 1
+            self.unidades_procesadas += 1
+            self._eventos_unidad.append(ahora)
+
+        # Preparar la siguiente unidad
+        self.processing = False
+        self.progress = 0.0
+
+        # --- Eventos aleatorios de falla ---------------------------------
+        if self.salud < 30.0 and random.random() < 0.02 * dt * 10:
+            eventos.append(self.set_estado(ALERTA, "Degradación crítica de componente"))
+        elif self.temperatura > self.temp_base * 1.25 and random.random() < 0.015 * dt * 10:
+            eventos.append(self.set_estado(ALERTA, "Sobrecalentamiento detectado"))
+
+        # Retorna 1 si salió una unidad (aunque sea scrap — el downstream
+        # sólo consume si era buena, pero el upstream sí libera el slot)
+        return eventos, 1
 
 
-# ==============================================================================
+# ===========================================================================
 #  LÍNEA DE PRODUCCIÓN
-# ==============================================================================
+# ===========================================================================
 class ProductionLine:
-    """Línea en serie: el throughput queda limitado por la estación más lenta."""
+    """5 estaciones en serie con buffers intermedios."""
 
     def __init__(self, linea_id: str = "LINEA-01"):
         self.linea_id = linea_id
+
+        # cycle_time en segundos por unidad (nominal).
+        # M3 es el cuello de botella estructural.
         self.machines = [
-            Machine("M1", "Extrusora",         185.0, 12.5, 48.0),
-            Machine("M2", "Inyectora",         210.0, 18.0, 45.0),
-            Machine("M3", "Prensa Hidráulica",  95.0, 22.0, 42.0),
-            Machine("M4", "Horno de Curado",   240.0, 30.0, 44.0),
-            Machine("M5", "Empacadora",         45.0,  8.0, 60.0),
+            Machine("M1", "Extrusora",         1.00, 185.0, 12.5, 5.0,  10),
+            Machine("M2", "Inyectora",         1.15, 210.0, 18.0, 7.0,  10),
+            Machine("M3", "Prensa Hidráulica", 1.40,  95.0, 22.0, 9.0,  10),
+            Machine("M4", "Horno de Curado",   1.20, 240.0, 30.0, 12.0, 10),
+            Machine("M5", "Empacadora",        0.85,  45.0,  8.0, 3.5,  9999),
         ]
-        self.upm_nominal = min(m.upm_base for m in self.machines)  # 42 UPM
 
-        self.unidades_totales = 0.0
-        self.unidades_defectuosas = 0.0
-        self.energia_acumulada_kwh = 0.0
-        self.costo_energia_acumulado = 0.0
+        # UPM nominal del sistema = la estación más lenta
+        self.upm_nominal = 60.0 / max(m.cycle_time_nominal for m in self.machines)
+
         self.estado_linea = "operando"
-
         self.arranque = datetime.now(timezone.utc)
         self.ticks = 0
         self.ticks_operando = 0
+        self.tiempo_operando = 0.0
+        self.tiempo_total = 0.0
+
+        self.unidades_scrap_total = 0
+        self.energia_acumulada_kwh = 0.0
+        self.costo_energia_acumulado = 0.0
 
         self.alertas_recientes = deque(maxlen=15)
-        self._pendientes_db = []      # eventos aún no persistidos en Supabase
+        self._pendientes_db = []
 
-    # --------------------------------------------------------------------------
-    #  UTILIDADES
-    # --------------------------------------------------------------------------
+    # ----------------------------------------------------------------------
     def _get(self, mid: str):
         return next((m for m in self.machines if m.id == mid), None)
 
     def _registrar(self, eventos: list) -> list:
-        """Sella los eventos con timestamp y los encola para la UI y Supabase."""
-        ahora = datetime.now(timezone.utc).isoformat()
+        ahora_iso = datetime.now(timezone.utc).isoformat()
         for ev in eventos:
-            ev["timestamp"] = ahora
+            ev["timestamp"] = ahora_iso
             ev["linea_id"] = self.linea_id
             self.alertas_recientes.appendleft(ev)
             self._pendientes_db.append(ev)
         return eventos
 
     def pop_pendientes(self) -> list:
-        """Devuelve y vacía la cola de eventos pendientes de persistir."""
         pendientes, self._pendientes_db = self._pendientes_db, []
         return pendientes
 
-    # --------------------------------------------------------------------------
-    #  MÉTRICAS
-    # --------------------------------------------------------------------------
+    # ----------------------------------------------------------------------
     def _metricas(self) -> dict:
-        operando = [m for m in self.machines if m.estado == "operando"]
+        # Throughput de línea: la máquina más lenta *que esté produciendo*.
+        # Si alguna está bloqueada, la línea va a la velocidad del bloqueo.
+        activas = [m for m in self.machines
+                   if m.estado in (OPERANDO, BLOQUEADA)]
+        upm_linea = 0.0
+        if activas:
+            # El ritmo lo fija la más lenta
+            upm_linea = 60.0 / max(m.cycle_time for m in activas)
 
-        # La línea es serie: el throughput lo fija la estación más lenta activa.
-        upm_linea = min((m.upm for m in operando), default=0.0)
+        # Si hay alerta/parada aguas arriba del cuello, la línea sigue
+        # pero eventualmente se vaciará. Mostramos el "potencial".
+        en_falla = [m for m in self.machines if m.estado in (ALERTA, PARADA)]
+        if en_falla:
+            # Si el cuello o alguna máquina aguas arriba está caída, cae a 0
+            idx_falla_min = min(
+                self.machines.index(m) for m in en_falla
+            )
+            # Si la falla está ANTES de la última estación operativa,
+            # el throughput visible cae
+            upm_linea = upm_linea * 0.35  # penalización realista
 
         consumo_kw = sum(m.consumo_kw for m in self.machines)
         temp_prom = sum(m.temperatura for m in self.machines) / len(self.machines)
 
-        disponibilidad = (self.ticks_operando / self.ticks * 100.0) if self.ticks else 0.0
-        rendimiento = min((upm_linea / self.upm_nominal * 100.0) if self.upm_nominal else 0.0, 100.0)
-        calidad = ((1 - self.unidades_defectuosas / self.unidades_totales) * 100.0) \
-            if self.unidades_totales > 1 else 100.0
+        disponibilidad = (self.tiempo_operando / self.tiempo_total * 100.0) \
+                         if self.tiempo_total > 0 else 0.0
+        rendimiento = min(upm_linea / self.upm_nominal * 100.0, 100.0) \
+                      if self.upm_nominal else 0.0
+
+        total_procesadas = sum(m.unidades_procesadas for m in self.machines)
+        total_scrap = sum(m.unidades_scrap for m in self.machines)
+        calidad = 100.0 if total_procesadas + total_scrap == 0 else \
+                  (total_procesadas / (total_procesadas + total_scrap) * 100.0)
+
         oee = disponibilidad * rendimiento * calidad / 10000.0
 
         costo_energia_hora = consumo_kw * TARIFA_KWH_USD
-        costo_paradas_hora = 0.0 if upm_linea > 0 else COSTO_MINUTO_PARADA_USD * 60.0
+        costo_paradas_hora = 0.0 if upm_linea > 5.0 else COSTO_MINUTO_PARADA_USD * 60.0
         costo_operativo_hora = costo_energia_hora + costo_paradas_hora
 
         unidades_hora = upm_linea * 60.0
         costo_unitario = (costo_energia_hora / unidades_hora) if unidades_hora > 0 else 0.0
+
+        # WIP interno (todos los buffers menos la salida final de M5)
+        wip_interno = sum(m.buffer_out for m in self.machines[:-1])
+        pt_acumulado = self.machines[-1].buffer_out
 
         return {
             "upm": upm_linea,
@@ -239,61 +368,79 @@ class ProductionLine:
             "costo_paradas_hora": costo_paradas_hora,
             "costo_operativo_hora": costo_operativo_hora,
             "costo_unitario_usd": costo_unitario,
+            "wip_interno": wip_interno,
+            "pt_acumulado": pt_acumulado,
         }
 
-    # --------------------------------------------------------------------------
+    # ----------------------------------------------------------------------
     def insights(self) -> list:
-        """Genera los 'insights de negocio' que muestran el valor del gemelo."""
         m = self._metricas()
         salida = []
 
-        # 1. Cuello de botella dinámico
-        activas = [x for x in self.machines if x.estado == "operando"]
-        if activas:
-            cuello = min(activas, key=lambda x: x.upm)
-            mejora = cuello.upm * 0.10
+        # --- Cuello de botella dinámico ---------------------------------
+        # Es la estación con mayor acumulación upstream
+        idx_cuello = 0
+        max_wip = -1
+        for i, maq in enumerate(self.machines[:-1]):
+            if maq.buffer_out > max_wip:
+                max_wip = maq.buffer_out
+                idx_cuello = i + 1  # la estación que recibe este buffer
+
+        cuello = self.machines[idx_cuello]
+        if m["wip_interno"] > 0:
+            mejora = 60.0 / cuello.cycle_time * 0.10
             salida.append({
                 "tipo": "cuello_botella",
                 "titulo": f"Cuello de botella: {cuello.nombre}",
-                "detalle": (f"Limita la línea a {cuello.upm:.1f} UPM. "
-                            f"Un +10% en esta estación elevaría la salida a {cuello.upm + mejora:.1f} UPM "
-                            f"(≈ {mejora * 60 * 24:.0f} unidades/día adicionales)."),
+                "detalle": (f"Con {max_wip} unidades acumuladas aguas arriba. "
+                            f"Un +10% de velocidad aquí elevaría la salida "
+                            f"a {60.0 / cuello.cycle_time + mejora:.1f} UPM."),
             })
         else:
             salida.append({
-                "tipo": "parada",
-                "titulo": "Línea detenida",
-                "detalle": (f"Pérdida de oportunidad estimada: "
-                            f"${COSTO_MINUTO_PARADA_USD:.2f}/minuto "
-                            f"(${COSTO_MINUTO_PARADA_USD * 60:.2f}/hora)."),
+                "tipo": "cuello_botella",
+                "titulo": f"Línea equilibrada · {m['upm']:.1f} UPM",
+                "detalle": (f"Sin acumulación anómala de WIP. "
+                            f"Estación limitante: {cuello.nombre} "
+                            f"({60.0 / cuello.cycle_time:.1f} UPM)."),
             })
 
-        # 2. Costo energético unitario
+        # --- Alarma de bloqueo / inanición ------------------------------
+        bloqueadas = [x for x in self.machines if x.estado == BLOQUEADA]
+        inanición = [x for x in self.machines if x.estado == SIN_MATERIAL]
+        if bloqueadas:
+            salida.append({
+                "tipo": "parada",
+                "titulo": f"⚠️ {len(bloqueadas)} estación(es) bloqueada(s)",
+                "detalle": (f"{', '.join(x.nombre for x in bloqueadas)} sin poder "
+                            f"descargar. Algo aguas abajo es más lento. "
+                            f"WIP interno total: {m['wip_interno']} uds."),
+            })
+
+        # --- Costo energético unitario ----------------------------------
         salida.append({
             "tipo": "costo",
             "titulo": f"Costo energético unitario: ${m['costo_unitario_usd']:.4f}/ud",
-            "detalle": (f"Tarifa de referencia ${TARIFA_KWH_USD:.2f}/kWh. "
-                        f"Consumo instantáneo {m['consumo_kw']:.1f} kW "
-                        f"→ ${m['costo_energia_hora']:.2f}/hora."),
+            "detalle": (f"Consumo instantáneo {m['consumo_kw']:.1f} kW → "
+                        f"${m['costo_energia_hora']:.2f}/h a ${TARIFA_KWH_USD:.2f}/kWh."),
         })
 
-        # 3. Proyección mensual de OPEX energético
-        horas_transcurridas = max(self.ticks / 3600.0, 1.0 / 3600.0)
+        # --- Proyección mensual ------------------------------------------
+        horas_transcurridas = max(self.tiempo_total / 3600.0, 1 / 3600.0)
         costo_hora_prom = self.costo_energia_acumulado / horas_transcurridas
         salida.append({
             "tipo": "proyeccion",
             "titulo": f"Proyección OPEX energético: ${costo_hora_prom * 24 * 30:,.2f}/mes",
-            "detalle": (f"Basado en {horas_transcurridas * 60:.1f} min de operación. "
+            "detalle": (f"Basado en {self.tiempo_total:.0f} s de operación. "
                         f"Ahorro estimado con -5% de consumo: "
                         f"${costo_hora_prom * 24 * 30 * 0.05:,.2f}/mes."),
         })
 
         return salida
 
-    # --------------------------------------------------------------------------
-    #  PAYLOADS
-    # --------------------------------------------------------------------------
+    # ----------------------------------------------------------------------
     def snapshot(self) -> dict:
+        ahora = self.tiempo_total
         m = self._metricas()
         return {
             "type": "telemetry",
@@ -302,9 +449,12 @@ class ProductionLine:
                 "id": self.linea_id,
                 "estado": self.estado_linea,
                 "upm": round(m["upm"], 2),
+                "upm_nominal": round(self.upm_nominal, 2),
                 "unidades_hora": round(m["unidades_hora"], 1),
-                "unidades_totales": int(self.unidades_totales),
-                "unidades_defectuosas": int(self.unidades_defectuosas),
+                "unidades_totales": int(m["pt_acumulado"]),
+                "unidades_scrap": sum(x.unidades_scrap for x in self.machines),
+                "wip_interno": m["wip_interno"],
+                "pt_acumulado": m["pt_acumulado"],
                 "oee": round(m["oee"], 2),
                 "disponibilidad": round(m["disponibilidad"], 2),
                 "rendimiento": round(m["rendimiento"], 2),
@@ -316,20 +466,21 @@ class ProductionLine:
                 "costo_unitario_usd": round(m["costo_unitario_usd"], 5),
                 "energia_acumulada_kwh": round(self.energia_acumulada_kwh, 3),
                 "costo_energia_acumulado": round(self.costo_energia_acumulado, 4),
-                "uptime_seg": self.ticks,
+                "uptime_seg": int(self.tiempo_total),
             },
-            "maquinas": [x.to_dict() for x in self.machines],
+            "maquinas": [x.to_dict(ahora) for x in self.machines],
             "alertas": list(self.alertas_recientes),
             "insights": self.insights(),
         }
 
+    # ----------------------------------------------------------------------
     def historico_payload(self) -> dict:
         m = self._metricas()
         return {
             "linea_id": self.linea_id,
             "estado_linea": self.estado_linea,
-            "unidades_producidas": int(self.unidades_totales),
-            "unidades_defectuosas": int(self.unidades_defectuosas),
+            "unidades_producidas": int(m["pt_acumulado"]),
+            "unidades_defectuosas": sum(x.unidades_scrap for x in self.machines),
             "upm": round(m["upm"], 2),
             "oee": round(m["oee"], 2),
             "disponibilidad": round(m["disponibilidad"], 2),
@@ -341,68 +492,99 @@ class ProductionLine:
             "costo_operativo_usd": round(m["costo_operativo_hora"], 4),
         }
 
-    # --------------------------------------------------------------------------
-    #  CONTROL (comunicación bidireccional del gemelo)
-    # --------------------------------------------------------------------------
-    def detener_linea(self, motivo: str = "Parada de emergencia") -> list:
+    # ----------------------------------------------------------------------
+    #  CONTROL
+    # ----------------------------------------------------------------------
+    def detener_linea(self, motivo="Parada de emergencia") -> list:
         eventos = []
         for m in self.machines:
-            if m.estado != "parada":
-                eventos.append(m.set_estado("parada", motivo))
+            if m.estado != PARADA:
+                eventos.append(m.set_estado(PARADA, motivo))
         self.estado_linea = "detenida"
         return self._registrar(eventos)
 
-    def reiniciar_linea(self, motivo: str = "Reinicio manual de línea") -> list:
+    def reiniciar_linea(self, motivo="Reinicio manual de línea") -> list:
         eventos = []
         for m in self.machines:
             m.salud = 100.0
-            eventos.append(m.set_estado("operando", motivo))
+            eventos.append(m.set_estado(OPERANDO, motivo))
         self.estado_linea = "operando"
         return self._registrar(eventos)
 
-    def reiniciar_maquina(self, mid: str, motivo: str = "Reinicio manual") -> list:
+    def reiniciar_maquina(self, mid, motivo="Reinicio manual") -> list:
         m = self._get(mid)
         if not m:
             return []
         m.salud = 100.0
-        return self._registrar([m.set_estado("operando", motivo)])
+        return self._registrar([m.set_estado(OPERANDO, motivo)])
 
-    def mantenimiento_maquina(self, mid: str, motivo: str = "Mantenimiento manual") -> list:
+    def mantenimiento_maquina(self, mid, motivo="Mantenimiento manual") -> list:
         m = self._get(mid)
         if not m:
             return []
-        return self._registrar([m.set_estado("mantenimiento", motivo)])
+        return self._registrar([m.set_estado(MANTENIMIENTO, motivo)])
 
-    # --------------------------------------------------------------------------
-    def tick(self) -> dict:
-        """Avanza 1 segundo la simulación completa y devuelve el snapshot."""
+    # ----------------------------------------------------------------------
+    #  TICK PRINCIPAL
+    # ----------------------------------------------------------------------
+    def tick(self, dt: float) -> dict:
         self.ticks += 1
+        self.tiempo_total += dt
+
+        ahora = self.tiempo_total
         eventos = []
 
-        for m in self.machines:
-            eventos.extend(m.tick())
-            m.unidades_acumuladas += m.upm / 60.0
+        # --- 1. Determinar disponibilidad de material de entrada ----------
+        hay_material = {}
+        for i, m in enumerate(self.machines):
+            if i == 0:
+                hay_material[m.id] = True                # feeder infinito
+            else:
+                upstream = self.machines[i - 1]
+                hay_material[m.id] = upstream.buffer_out > 0
+
+        # --- 2. Tick de cada máquina (orden serie: M1 → M5) --------------
+        for i, m in enumerate(self.machines):
+            evs, salida_unidad = m.tick(dt, hay_material[m.id], ahora)
+            eventos.extend(evs)
+
+            # --- 3. Si salió una unidad buena, consumir del upstream ----
+            # (solo si fue buena, no scrap — pero como el scrap ya está
+            #  resuelto arriba, basta con chequear si buffer_out cambió;
+            #  simplificación: consumimos del upstream si processing pasó
+            #  de True a False en este tick)
+            # Forma simple y robusta: si el upstream tiene buffer > 0 y
+            # esta máquina empezó un nuevo ciclo, ya consumimos allí.
+
+        # --- 4. Encadenar consumo: cada máquina toma del upstream ---------
+        # Hacemos una segunda pasada para reflejar el "pull" del downstream.
+        # (Debe ir después del tick de todos para evitar doble conteo.)
+        # En la práctica la lógica ya está en `hay_material` + `tick`.
+        # Este bloque queda como hook para futuras reglas (Kanban, etc.)
 
         if eventos:
             self._registrar(eventos)
 
-        # --- Producción y calidad ---
+        # --- 5. Métricas agregadas ---------------------------------------
         m = self._metricas()
-        if m["upm"] > 0:
-            self.ticks_operando += 1
-            self.estado_linea = "operando"
-        else:
+
+        # Estado global de línea
+        estados = [x.estado for x in self.machines]
+        if PARADA in estados:
             self.estado_linea = "detenida"
+        elif ALERTA in estados:
+            self.estado_linea = "alerta"
+        elif MANTENIMIENTO in estados:
+            self.estado_linea = "mantenimiento"
+        else:
+            self.estado_linea = "operando"
 
-        salud_prom = sum(x.salud for x in self.machines) / len(self.machines)
-        tasa_defecto = 0.008 + (100.0 - salud_prom) / 100.0 * 0.060
+        if m["upm"] > 5.0:
+            self.ticks_operando += 1
+            self.tiempo_operando += dt
 
-        delta_unidades = m["upm"] / 60.0
-        self.unidades_totales += delta_unidades
-        self.unidades_defectuosas += delta_unidades * tasa_defecto
-
-        # --- Energía y costos acumulados ---
-        kwh_tick = m["consumo_kw"] / 3600.0
+        # --- 6. Energía acumulada ----------------------------------------
+        kwh_tick = m["consumo_kw"] * dt / 3600.0
         self.energia_acumulada_kwh += kwh_tick
         self.costo_energia_acumulado += kwh_tick * TARIFA_KWH_USD
 

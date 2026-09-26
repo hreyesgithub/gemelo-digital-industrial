@@ -38,8 +38,8 @@ logger = logging.getLogger("gemelo-digital")
 
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
-TICK_SECONDS = float(os.getenv("TICK_SECONDS", "1.0"))
-PERSIST_EVERY = int(os.getenv("PERSIST_EVERY", "5"))
+TICK_SECONDS = float(os.getenv("TICK_SECONDS", "0.25"))
+PERSIST_EVERY = int(os.getenv("PERSIST_EVERY", "20")) 
 
 db = Database(SUPABASE_URL, SUPABASE_KEY)
 linea = ProductionLine(linea_id="LINEA-01")
@@ -165,7 +165,7 @@ async def simulation_loop() -> None:
     contador = 0
     while True:
         try:
-            snapshot = linea.tick()
+            snapshot = linea.tick(TICK_SECONDS)
             await manager.broadcast(snapshot)
 
             contador += 1
