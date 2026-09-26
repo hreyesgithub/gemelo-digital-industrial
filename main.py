@@ -14,6 +14,7 @@ import json
 import logging
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import List, Optional
 
 from dotenv import load_dotenv
@@ -165,8 +166,10 @@ async def simulation_loop() -> None:
     contador = 0
     while True:
         try:
-            snapshot = linea.tick(TICK_SECONDS)
-            await manager.broadcast(snapshot)
+            snapshot = linea.tick(
+                TICK_SECONDS,
+            )
+            await manager.broadcast(dict(snapshot))
 
             contador += 1
             if contador % PERSIST_EVERY == 0:

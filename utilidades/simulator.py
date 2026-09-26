@@ -134,10 +134,17 @@ class Machine:
         }
 
     # ----------------------------------------------------------------------
+        # ----------------------------------------------------------------------
     def tick(self, dt: float, hay_material_entrada: bool, ahora: float) -> tuple:
-        """Avanza un paso. Retorna (eventos, unidades_que_salieron_del_ciclo)."""
+        """
+        Avanza un paso. Retorna (eventos, salida_unidad, consume_upstream).
+          - salida_unidad    : 1 si terminó una unidad en este tick (buena o scrap)
+          - consume_upstream : 1 si en este tick tomó UNA unidad del buffer del
+                               upstream (para que ProductionLine la reste).
+        """
         eventos = []
         self.tiempo_en_estado += dt
+        consume_upstream = 0                              
 
         # ============ Estados no operativos ================================
         if self.estado == PARADA:
@@ -146,7 +153,7 @@ class Machine:
             self.temperatura = max(24.0, self.temperatura - 1.8 * dt)
             self.consumo_kw = max(0.0, self.consumo_kw * (1 - 0.55 * dt))
             self.vibracion = 0.0
-            return eventos, 0
+            return eventos, 0, 0                            
 
         if self.estado == MANTENIMIENTO:
             self.processing = False
@@ -157,7 +164,7 @@ class Machine:
             self.vibracion = max(0.02, self.vibracion * (1 - 2.0 * dt))
             if self.salud >= 97.5 and self.tiempo_en_estado >= 5.0:
                 eventos.append(self.set_estado(OPERANDO, "Mantenimiento completado"))
-            return eventos, 0
+            return eventos, 0, 0                             
 
         if self.estado == ALERTA:
             self.processing = False
@@ -171,36 +178,33 @@ class Machine:
             if self.tiempo_en_estado > 20.0:
                 eventos.append(self.set_estado(MANTENIMIENTO,
                                                "Auto-recuperación de emergencia"))
-            return eventos, 0
+            return eventos, 0, 0                             
 
         # ============ Estados productivos ==================================
-        # Degradación de salud mientras está encendida
         self.salud = max(0.0, self.salud - random.uniform(0.05, 0.20) * dt)
 
-        # Temperatura: sube hacia temp_base procesando, baja si está en espera
         target_temp = self.temp_base if self.processing else self.temp_base * 0.75
         self.temperatura += (target_temp - self.temperatura) * (0.40 * dt) \
                             + random.uniform(-0.6, 0.6) * dt
 
-        # Consumo: alto procesando, bajo en espera
         target_kw = self.kw_process if self.processing else self.kw_idle
         self.consumo_kw += (target_kw - self.consumo_kw) * (0.50 * dt)
         self.consumo_kw = max(0.3, self.consumo_kw)
 
-        # Vibración proporcional a la degradación
         base_vib = (1 - self.salud / 100.0) * 3.0
         self.vibracion = max(0.05, base_vib + random.uniform(0.05, 0.30))
 
-        # --- ¿Tenemos una unidad dentro? ---------------------------------
+        # --- ¿Tenemos una unidad dentro? ----------------------------------
         if not self.processing:
             if hay_material_entrada:
                 self.processing = True
                 self.progress = 0.0
                 self.estado = OPERANDO
                 self.tiempo_en_estado = 0.0
+                consume_upstream = 1                    
             else:
                 self.estado = SIN_MATERIAL
-                return eventos, 0
+                return eventos, 0, 0                    
 
         # --- Avanzar el ciclo --------------------------------------------
         factor_salud = 0.85 + 0.15 * (self.salud / 100.0)
@@ -209,13 +213,13 @@ class Machine:
 
         if self.progress < 1.0:
             self.estado = OPERANDO
-            return eventos, 0
+            return eventos, 0, consume_upstream          
 
         # --- Ciclo completado: ¿podemos empujar al buffer? ---------------
         if self.buffer_out >= self.buffer_capacity:
             self.progress = 1.0
             self.estado = BLOQUEADA
-            return eventos, 0
+            return eventos, 0, consume_upstream         
 
         # --- Control de calidad ------------------------------------------
         scrap_rate = self.scrap_rate_base + (100 - self.salud) / 100 * 0.05
@@ -238,7 +242,6 @@ class Machine:
             self.unidades_procesadas += 1
             self._eventos_unidad.append(ahora)
 
-        # Preparar la siguiente unidad
         self.processing = False
         self.progress = 0.0
 
@@ -248,9 +251,7 @@ class Machine:
         elif self.temperatura > self.temp_base * 1.25 and random.random() < 0.015 * dt * 10:
             eventos.append(self.set_estado(ALERTA, "Sobrecalentamiento detectado"))
 
-        # Retorna 1 si salió una unidad (aunque sea scrap — el downstream
-        # sólo consume si era buena, pero el upstream sí libera el slot)
-        return eventos, 1
+        return eventos, 1, consume_upstream
 
 
 # ===========================================================================
@@ -534,41 +535,39 @@ class ProductionLine:
         ahora = self.tiempo_total
         eventos = []
 
-        # --- 1. Determinar disponibilidad de material de entrada ----------
-        hay_material = {}
+        # --- 1 + 2. Tick de cada máquina, en orden serie, con disponibilidad
+        #           recalculada ANTES de cada máquina (para que vea el efecto
+        #           inmediato del completado del upstream en este mismo tick).
         for i, m in enumerate(self.machines):
+            # Disponibilidad de material: el feeder (M1) siempre tiene, el
+            # resto mira el buffer del upstream EN ESTE INSTANTE.
             if i == 0:
-                hay_material[m.id] = True                # feeder infinito
+                hay_material = True
             else:
-                upstream = self.machines[i - 1]
-                hay_material[m.id] = upstream.buffer_out > 0
+                hay_material = self.machines[i - 1].buffer_out > 0
 
-        # --- 2. Tick de cada máquina (orden serie: M1 → M5) --------------
-        for i, m in enumerate(self.machines):
-            evs, salida_unidad = m.tick(dt, hay_material[m.id], ahora)
+            evs, salida_unidad, consume_upstream = m.tick(dt, hay_material, ahora)
             eventos.extend(evs)
 
-            # --- 3. Si salió una unidad buena, consumir del upstream ----
-            # (solo si fue buena, no scrap — pero como el scrap ya está
-            #  resuelto arriba, basta con chequear si buffer_out cambió;
-            #  simplificación: consumimos del upstream si processing pasó
-            #  de True a False en este tick)
-            # Forma simple y robusta: si el upstream tiene buffer > 0 y
-            # esta máquina empezó un nuevo ciclo, ya consumimos allí.
+            # --- 3. Cascada: si esta máquina tomó del upstream, restamos ---
+            if consume_upstream and i > 0:
+                upstream = self.machines[i - 1]
+                if upstream.buffer_out > 0:
+                    upstream.buffer_out -= 1
 
-        # --- 4. Encadenar consumo: cada máquina toma del upstream ---------
-        # Hacemos una segunda pasada para reflejar el "pull" del downstream.
-        # (Debe ir después del tick de todos para evitar doble conteo.)
-        # En la práctica la lógica ya está en `hay_material` + `tick`.
-        # Este bloque queda como hook para futuras reglas (Kanban, etc.)
+                    # Si el upstream estaba bloqueado y acabamos de liberarle
+                    # espacio, despertarlo para que retome el flujo en el
+                    # siguiente tick (si no está en falla ni parada).
+                    if upstream.estado == BLOQUEADA and upstream.processing:
+                        upstream.estado = OPERANDO
 
         if eventos:
             self._registrar(eventos)
 
-        # --- 5. Métricas agregadas ---------------------------------------
+        # --- 4. Métricas agregadas ---------------------------------------
         m = self._metricas()
 
-        # Estado global de línea
+        # --- 5. Estado global de línea -----------------------------------
         estados = [x.estado for x in self.machines]
         if PARADA in estados:
             self.estado_linea = "detenida"
