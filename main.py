@@ -228,7 +228,7 @@ app.add_middleware(
 # ------------------------------------------------------------------------------
 #  ENDPOINTS REST
 # ------------------------------------------------------------------------------
-@app.get("/api/health")
+@app.get("/api/health", methods=["GET", "HEAD"])
 async def health():
     return {
         "status": "ok",
