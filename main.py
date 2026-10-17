@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import List, Optional
@@ -40,7 +41,10 @@ logger = logging.getLogger("gemelo-digital")
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
 TICK_SECONDS = float(os.getenv("TICK_SECONDS", "0.25"))
-PERSIST_EVERY = int(os.getenv("PERSIST_EVERY", "20")) 
+PERSIST_EVERY = int(os.getenv("PERSIST_EVERY", "120"))
+CLIENT_IDLE_SECONDS = int(
+    os.getenv("CLIENT_IDLE_SECONDS", "300")
+)  # sin comandos → cerrar
 
 db = Database(SUPABASE_URL, SUPABASE_KEY)
 linea = ProductionLine(linea_id="LINEA-01")
@@ -65,22 +69,26 @@ class ConnectionManager:
     def __init__(self):
         self.active: List[WebSocket] = []
         self.lock = asyncio.Lock()
+        self.hay_clientes = asyncio.Event()
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
         async with self.lock:
             self.active.append(ws)
+            self.hay_clientes.set()
         logger.info("Cliente WebSocket conectado. Total: %d", len(self.active))
 
     async def disconnect(self, ws: WebSocket) -> None:
         async with self.lock:
             if ws in self.active:
                 self.active.remove(ws)
+            if not self.active:
+                self.hay_clientes.clear()
         logger.info("Cliente WebSocket desconectado. Total: %d", len(self.active))
 
     async def broadcast(self, message: dict) -> None:
         async with self.lock:
-            targets = list(self.active)
+            targets = self.active.copy()
         if not targets:
             return
 
@@ -166,9 +174,13 @@ async def simulation_loop() -> None:
     contador = 0
     while True:
         try:
-            snapshot = linea.tick(
-                TICK_SECONDS,
-            )
+            # Sin clientes: no simular ni escribir en Supabase
+            if not manager.active:
+                logger.info("Sin clientes: simulación en pausa")
+                await manager.hay_clientes.wait()
+                logger.info("Cliente conectado: simulación reanudada")
+
+            snapshot = linea.tick(TICK_SECONDS)
             await manager.broadcast(dict(snapshot))
 
             contador += 1
@@ -214,9 +226,7 @@ app = FastAPI(
 #  Ejemplo: ALLOWED_ORIGINS=https://venezuelainsights.com,https://tu-proyecto.web.app
 # ------------------------------------------------------------------------------
 ALLOWED_ORIGINS = [
-    o.strip()
-    for o in os.getenv("ALLOWED_ORIGINS", "*").split(",")
-    if o.strip()
+    o.strip() for o in os.getenv("ALLOWED_ORIGINS", "*").split(",") if o.strip()
 ]
 
 app.add_middleware(
@@ -304,13 +314,31 @@ async def reiniciar_linea():
 # ------------------------------------------------------------------------------
 @app.websocket("/ws")
 async def websocket_endpoint(ws: WebSocket):
+    # Validación de origen (CORSMiddleware no protege WebSockets)
+    origin = ws.headers.get("origin", "")
+    if ALLOWED_ORIGINS != ["*"] and origin not in ALLOWED_ORIGINS:
+        await ws.close(code=1008)
+        return
+
     await manager.connect(ws)
+    ultimo_comando = time.monotonic()
+
     try:
-        # Snapshot inmediato al conectar
         await ws.send_text(json.dumps(linea.snapshot(), default=str))
 
         while True:
-            raw = await ws.receive_text()
+            try:
+                raw = await asyncio.wait_for(ws.receive_text(), timeout=30)
+            except asyncio.TimeoutError:
+                if time.monotonic() - ultimo_comando > CLIENT_IDLE_SECONDS:
+                    await ws.send_text(json.dumps({
+                        "type": "session_timeout",
+                        "detail": "Sesión pausada por inactividad. Pulsa Reanudar para continuar.",
+                    }))
+                    await ws.close(code=4000)
+                    break
+                continue
+
             try:
                 msg = json.loads(raw)
             except json.JSONDecodeError:
@@ -321,6 +349,8 @@ async def websocket_endpoint(ws: WebSocket):
 
             if msg.get("type") != "command":
                 continue
+
+            ultimo_comando = time.monotonic()
 
             try:
                 resultado = ejecutar_comando(
@@ -351,9 +381,10 @@ async def websocket_endpoint(ws: WebSocket):
             await manager.broadcast(linea.snapshot())
 
     except WebSocketDisconnect:
-        await manager.disconnect(ws)
+        pass
     except Exception as exc:
         logger.exception("Error en WebSocket: %s", exc)
+    finally:
         await manager.disconnect(ws)
 
 
@@ -376,11 +407,11 @@ else:
             "servicio": "Gemelo Digital · API",
             "version": "1.0.0",
             "endpoints": {
-                "health":    "/api/health",
-                "snapshot":  "/api/snapshot",
-                "alertas":   "/api/alertas",
-                "control":   "/api/control",
+                "health": "/api/health",
+                "snapshot": "/api/snapshot",
+                "alertas": "/api/alertas",
+                "control": "/api/control",
                 "websocket": "/ws",
-                "docs":      "/docs",
+                "docs": "/docs",
             },
         }
